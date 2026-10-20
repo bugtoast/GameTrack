@@ -2,6 +2,7 @@ import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
 import path from "path";
 import crypto from "crypto";
+import { styleText } from "node:util";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -12,6 +13,10 @@ import { DATA_DIR, DIST_DIR, POSTERS_DIR, ensureDataDir } from "./server/paths";
 
 const PORT = Number.parseInt(process.env.PORT || "3001", 10);
 const HOST = process.env.HOST || "127.0.0.1";
+
+// IPv6 literals must be bracketed in URLs (http://[::1]:3001/).
+const URL_HOST = HOST.includes(":") ? `[${HOST}]` : HOST;
+const SERVER_URL = `http://${URL_HOST}:${PORT}/`;
 
 // A shared secret enables a lightweight bearer-token gate on all /api routes.
 // When unset, the server trusts loopback access (single-user local mode).
@@ -410,7 +415,6 @@ async function createApp(production = false) {
   );
 
   if (!IS_PRODUCTION) {
-    console.log("Starting in DEVELOPMENT mode with Vite Middleware...");
     // Lazy-load Vite only in dev so the production bundle (e.g. Docker's
     // --omit=dev install) never has to resolve the devDependency.
     const { createServer } = await import("vite");
@@ -512,12 +516,40 @@ async function createApp(production = false) {
   return app;
 }
 
+function logServerReady(production: boolean, viteVersion: string, readyMs: number) {
+  if (production) {
+    console.log(`GameTrack server running on ${SERVER_URL}${API_TOKEN ? " (API token auth enabled)" : ""}`);
+    return;
+  }
+
+  // Match Vite's standard startup banner so this looks like any other Vite app.
+  const vite = styleText(["green", "bold"], "VITE") + styleText("green", ` v${viteVersion}`);
+  const duration = styleText("dim", "ready in ") + styleText("bold", String(readyMs)) + styleText("dim", " ms");
+  const arrow = styleText("green", "➜");
+  const label = styleText("bold", "Local");
+  const url = styleText(
+    "cyan",
+    SERVER_URL.replace(/:(\d+)\//, (_, port) => `:${styleText("bold", port)}/`)
+  );
+
+  console.log(`\n  ${vite}  ${duration}\n`);
+  console.log(`  ${arrow}  ${label}:   ${url}`);
+  if (API_TOKEN) {
+    console.log(`  ${styleText("dim", "API token auth enabled")}`);
+  }
+  console.log("");
+}
+
 async function startServer() {
+  const startedAt = performance.now();
   const IS_PRODUCTION = process.env.NODE_ENV === "production";
   const app = await createApp(IS_PRODUCTION);
+  // Vite is already loaded in dev by createApp(); this is a cache hit and keeps
+  // the devDependency out of the production runtime entirely.
+  const viteVersion = IS_PRODUCTION ? "" : (await import("vite")).version;
 
   const server = app.listen(PORT, HOST, () => {
-    console.log(`GameTrack server running on http://${HOST}:${PORT}${API_TOKEN ? " (API token auth enabled)" : ""}`);
+    logServerReady(IS_PRODUCTION, viteVersion, Math.ceil(performance.now() - startedAt));
   });
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
@@ -528,23 +560,21 @@ async function startServer() {
     process.exit(1);
   });
 
-  // Graceful shutdown: let active requests finish before exiting.
-  const shutdown = async (signal: string) => {
-    console.log(`\n${signal} received. Shutting down gracefully...`);
+  // Graceful shutdown: let active requests finish before exiting. Like Vite and
+  // other npm dev servers, Ctrl+C exits without printing a custom shutdown log.
+  const shutdown = () => {
     server.close(() => {
-      console.log("Server closed.");
       db.close();
-      console.log("Database connection closed. Exiting.");
       process.exit(0);
     });
     // Force exit if connections refuse to drain.
     setTimeout(() => {
-      console.error("Forced shutdown after timeout.");
+      console.error(`  ${styleText("red", "✗")}  ${styleText("red", "Forced shutdown after timeout.")}`);
       process.exit(1);
     }, 10_000).unref();
   };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 startServer().catch((err) => {
